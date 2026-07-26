@@ -1,6 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "buildCommand": "python3 -m pip install -q gdown pillow numpy pandas scikit-learn opencv-python-headless && mkdir -p public && printf '<html><body>python packages ok</body></html>' > public/index.html",
+  "buildCommand": "python3 --version && mkdir -p public && python3 --version > public/python.txt && printf '<html><body>python ok</body></html>' > public/index.html",
   "outputDirectory": "public",
   "installCommand": "echo skip"
 }
