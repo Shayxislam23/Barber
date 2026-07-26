@@ -15,9 +15,23 @@ jobs:
         with:
           python-version: '3.11'
       - name: Run solver
-        run: python solve_lighting.py
-      - name: Upload artifact
+        id: solver
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          python solve_lighting.py 2>&1 | tee solver.log
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lighting-diagnostics
+          path: solver.log
+      - name: Upload submission
+        if: steps.solver.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: submission-lighting
           path: submission_lighting.csv
+      - name: Fail job when solver failed
+        if: steps.solver.outcome != 'success'
+        run: exit 1
