@@ -1,141 +1,245 @@
-from pathlib import Path
+from __future__ import annotations
+
+import csv
+import os
 import zipfile
-import subprocess
-import sys
+from concurrent.futures import ProcessPoolExecutor
+from io import BytesIO, TextIOWrapper
+from pathlib import Path, PurePosixPath
 
-subprocess.check_call([
-    sys.executable, '-m', 'pip', 'install', '-q',
-    'gdown', 'pillow', 'numpy', 'pandas', 'scikit-learn', 'opencv-python-headless'
-])
-
-import gdown
-import cv2
 import numpy as np
-import pandas as pd
-from PIL import Image
-from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier, HistGradientBoostingClassifier, VotingClassifier
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.svm import SVC
-from sklearn.model_selection import StratifiedKFold, cross_val_score
+import requests
+from PIL import Image, ImageFile
 
-FILE_ID = '1a1CqcUCqULZM9w6Rjc5cJT8rvG8bKpH9'
-ROOT = Path('work')
-ZIP = ROOT / 'lighting.zip'
-EXTRACT = ROOT / 'data'
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+ROOT = Path("work")
+ZIP_PATH = ROOT / "lighting.zip"
+PUBLIC_LINK = "https://cloud.mail.ru/public/GCsv/1BXmZPEBj"
+WEBLINK_SUFFIX = "GCsv/1BXmZPEBj"
 ROOT.mkdir(exist_ok=True)
 
-if not ZIP.exists():
-    print('Downloading dataset...')
-    result = gdown.download(id=FILE_ID, output=str(ZIP), quiet=False, fuzzy=True)
-    if not result or not ZIP.exists():
-        raise RuntimeError('Dataset download failed')
 
-if not EXTRACT.exists():
-    EXTRACT.mkdir(parents=True, exist_ok=True)
-    print('Extracting dataset...')
-    with zipfile.ZipFile(ZIP) as zf:
-        zf.extractall(EXTRACT)
-
-exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
-all_images = [p for p in EXTRACT.rglob('*') if p.is_file() and p.suffix.lower() in exts]
-print('Images found:', len(all_images))
-
-train_items = []
-test_items = []
-for p in all_images:
-    parts = [x.lower() for x in p.parts]
-    parent = p.parent.name
-    if parent in {'0', '1', '2'}:
-        train_items.append((p, int(parent)))
-    elif 'test' in parts:
-        test_items.append(p)
-
-if not train_items or not test_items:
-    raise RuntimeError(f'Could not identify train/test images. train={len(train_items)}, test={len(test_items)}')
-
-train_items.sort(key=lambda x: x[0].stem)
-test_items.sort(key=lambda p: p.stem)
-print('Train:', len(train_items), 'Test:', len(test_items))
+def download_dataset() -> None:
+    dispatcher = requests.get(
+        "https://cloud.mail.ru/api/v2/dispatcher",
+        timeout=60,
+        headers={"User-Agent": "Mozilla/5.0"},
+    )
+    dispatcher.raise_for_status()
+    prefix = dispatcher.json()["body"]["weblink_get"][0]["url"].rstrip("/")
+    direct_url = f"{prefix}/{WEBLINK_SUFFIX}"
+    print("Downloading image archive...", flush=True)
+    with requests.get(
+        direct_url,
+        stream=True,
+        allow_redirects=True,
+        timeout=(60, 1200),
+        headers={"User-Agent": "Mozilla/5.0", "Referer": PUBLIC_LINK},
+    ) as response:
+        response.raise_for_status()
+        with ZIP_PATH.open("wb") as output:
+            for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
+                if chunk:
+                    output.write(chunk)
+    if ZIP_PATH.stat().st_size < 100_000_000 or not zipfile.is_zipfile(ZIP_PATH):
+        raise RuntimeError("Dataset download is invalid")
+    print(f"Archive downloaded: {ZIP_PATH.stat().st_size / 1024**2:.1f} MB", flush=True)
 
 
-def features(path: Path):
-    img = Image.open(path).convert('RGB').resize((192, 128))
-    a = np.asarray(img, dtype=np.float32) / 255.0
-    gray = 0.2126*a[...,0] + 0.7152*a[...,1] + 0.0722*a[...,2]
-    hsv = cv2.cvtColor((a*255).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
-    sat = hsv[...,1] / 255.0
-    val = hsv[...,2] / 255.0
-    f = []
-    qs = [0,1,2,5,10,15,20,25,30,40,50,60,70,75,80,85,90,95,98,99,100]
-    f += np.percentile(gray, qs).tolist()
-    f += [gray.mean(), gray.std(), np.median(gray), gray.min(), gray.max(), gray.max()-gray.min()]
-    hist, _ = np.histogram(gray, bins=64, range=(0,1), density=True)
-    f += hist.tolist()
-    for t in [0.01,0.02,0.03,0.05,0.08,0.1,0.15,0.2,0.25,0.3,0.4,0.5]:
-        f.append(float((gray <= t).mean()))
-    for t in [0.5,0.6,0.7,0.75,0.8,0.85,0.9,0.92,0.95,0.97,0.99]:
-        f.append(float((gray >= t).mean()))
-    for c in range(3):
-        ch = a[...,c]
-        f += [ch.mean(), ch.std(), ch.min(), ch.max()] + np.percentile(ch,[1,5,10,25,50,75,90,95,99]).tolist()
-    for ch in [sat, val]:
-        f += [ch.mean(), ch.std(), ch.min(), ch.max()] + np.percentile(ch,[1,5,10,25,50,75,90,95,99]).tolist()
-    h,w = gray.shape
-    for gy in range(4):
-        for gx in range(4):
-            b = gray[gy*h//4:(gy+1)*h//4, gx*w//4:(gx+1)*w//4]
-            f += [b.mean(), b.std()] + np.percentile(b,[10,50,90]).tolist()
-    for gy in range(3):
-        for gx in range(3):
-            b = gray[gy*h//3:(gy+1)*h//3, gx*w//3:(gx+1)*w//3]
-            f += [b.mean(), np.percentile(b,25), np.percentile(b,75)]
-    gx = np.diff(gray, axis=1, append=gray[:,-1:])
-    gy = np.diff(gray, axis=0, append=gray[-1:,:])
-    grad = np.sqrt(gx*gx + gy*gy)
-    lap = cv2.Laplacian((gray*255).astype(np.uint8), cv2.CV_32F)
-    probs = hist/(hist.sum()+1e-12)
-    entropy = float(-(probs*np.log(probs+1e-12)).sum())
-    f += [grad.mean(), grad.std(), np.percentile(grad,90), np.percentile(grad,99), lap.var(), entropy]
-    f += [
-        gray.mean()/(gray.std()+1e-6),
-        np.percentile(gray,90)-np.percentile(gray,10),
-        np.percentile(gray,75)-np.percentile(gray,25),
-        val.mean()-sat.mean(),
-        float((gray < 0.1).mean() - (gray > 0.9).mean()),
+if not ZIP_PATH.exists() or not zipfile.is_zipfile(ZIP_PATH):
+    download_dataset()
+
+
+def csv_rows(archive: zipfile.ZipFile, member: str) -> list[dict[str, str]]:
+    with archive.open(member) as raw:
+        with TextIOWrapper(raw, encoding="utf-8-sig", newline="") as text:
+            return list(csv.DictReader(text))
+
+
+def best_csv(members: list[str], filename: str) -> str | None:
+    matches = [m for m in members if PurePosixPath(m).name.lower() == filename]
+    return min(matches, key=lambda m: (len(PurePosixPath(m).parts), len(m))) if matches else None
+
+
+with zipfile.ZipFile(ZIP_PATH) as archive:
+    members = [item.filename for item in archive.infolist() if not item.is_dir()]
+    extensions = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+    images = [m for m in members if PurePosixPath(m).suffix.lower() in extensions]
+    train_csv = best_csv(members, "train.csv")
+    test_csv = best_csv(members, "test.csv")
+
+    if train_csv and test_csv:
+        train_meta = csv_rows(archive, train_csv)
+        test_meta = csv_rows(archive, test_csv)
+        by_stem: dict[str, list[str]] = {}
+        for member in images:
+            by_stem.setdefault(PurePosixPath(member).stem, []).append(member)
+
+        def choose(item_id: str, split: str) -> str:
+            candidates = by_stem.get(str(item_id), [])
+            if not candidates:
+                raise KeyError(f"Missing image id {item_id}")
+            preferred = [m for m in candidates if split in [p.lower() for p in PurePosixPath(m).parts]]
+            return preferred[0] if preferred else candidates[0]
+
+        train_members = [choose(row["id"], "train") for row in train_meta]
+        labels = np.asarray([int(row["label"]) for row in train_meta], dtype=np.int64)
+        test_ids = [str(row["id"]) for row in test_meta]
+        test_members = [choose(item_id, "test") for item_id in test_ids]
+    else:
+        class_map = {"0": 0, "1": 1, "2": 2, "dark": 0, "normal": 1, "bright": 2}
+        train_pairs: list[tuple[str, int]] = []
+        test_members: list[str] = []
+        for member in images:
+            path = PurePosixPath(member)
+            parts = [p.lower() for p in path.parts]
+            parent = path.parent.name.lower()
+            if "test" in parts:
+                test_members.append(member)
+            elif parent in class_map:
+                train_pairs.append((member, class_map[parent]))
+        train_pairs.sort(key=lambda pair: PurePosixPath(pair[0]).stem)
+        test_members.sort(key=lambda m: PurePosixPath(m).stem)
+        train_members = [m for m, _ in train_pairs]
+        labels = np.asarray([label for _, label in train_pairs], dtype=np.int64)
+        test_ids = [PurePosixPath(m).stem for m in test_members]
+
+print(f"Images found: train={len(train_members)}, test={len(test_members)}", flush=True)
+if len(train_members) < 100 or len(test_members) < 10:
+    raise RuntimeError("Train/test image split was not identified")
+
+_WORKER_ARCHIVE: zipfile.ZipFile | None = None
+
+
+def init_worker(zip_name: str) -> None:
+    global _WORKER_ARCHIVE
+    _WORKER_ARCHIVE = zipfile.ZipFile(zip_name)
+
+
+def image_features(member: str) -> np.ndarray:
+    if _WORKER_ARCHIVE is None:
+        raise RuntimeError("Worker archive is not initialized")
+    with _WORKER_ARCHIVE.open(member) as source:
+        raw = source.read()
+    with Image.open(BytesIO(raw)) as image:
+        image.draft("RGB", (64, 64))
+        image = image.convert("RGB").resize((64, 64), Image.Resampling.BILINEAR)
+        rgb = np.asarray(image, dtype=np.float32) / 255.0
+
+    gray = 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+    value = rgb.max(axis=2)
+    minimum = rgb.min(axis=2)
+    saturation = (value - minimum) / (value + 1e-6)
+    qs = np.percentile(gray, [1, 5, 10, 20, 25, 40, 50, 60, 75, 80, 90, 95, 99])
+    features = [
+        gray.mean(), gray.std(), *qs.tolist(),
+        (gray < 0.05).mean(), (gray < 0.10).mean(), (gray < 0.20).mean(),
+        (gray > 0.80).mean(), (gray > 0.90).mean(), (gray > 0.95).mean(),
+        value.mean(), value.std(), saturation.mean(), saturation.std(),
     ]
-    return np.asarray(f, dtype=np.float32)
+    for channel in range(3):
+        ch = rgb[..., channel]
+        features.extend([ch.mean(), ch.std(), *np.percentile(ch, [10, 50, 90]).tolist()])
+    # Coarse spatial illumination pattern.
+    for row in range(3):
+        for col in range(3):
+            block = gray[row * 64 // 3:(row + 1) * 64 // 3, col * 64 // 3:(col + 1) * 64 // 3]
+            features.extend([block.mean(), block.std()])
+    gx = np.diff(gray, axis=1, append=gray[:, -1:])
+    gy = np.diff(gray, axis=0, append=gray[-1:, :])
+    gradient = np.sqrt(gx * gx + gy * gy)
+    features.extend([gradient.mean(), gradient.std(), np.percentile(gradient, 90)])
+    return np.asarray(features, dtype=np.float32)
 
-X = np.vstack([features(p) for p,_ in train_items])
-y = np.array([label for _,label in train_items])
-Xt = np.vstack([features(p) for p in test_items])
-print('Feature shapes:', X.shape, Xt.shape)
 
-models = {
-    'extra': ExtraTreesClassifier(n_estimators=1000, max_features=0.85, min_samples_leaf=1, class_weight='balanced', random_state=11, n_jobs=-1),
-    'rf': RandomForestClassifier(n_estimators=700, max_features=0.8, min_samples_leaf=1, class_weight='balanced', random_state=12, n_jobs=-1),
-    'hgb': HistGradientBoostingClassifier(max_iter=350, learning_rate=0.04, max_leaf_nodes=31, l2_regularization=2.0, random_state=13),
-    'svc': make_pipeline(StandardScaler(), SVC(C=12, gamma='scale', probability=True, class_weight='balanced', random_state=14)),
-}
+def feature_matrix(items: list[str], name: str) -> np.ndarray:
+    workers = max(1, min(4, os.cpu_count() or 2))
+    print(f"Computing {name} features with {workers} workers...", flush=True)
+    with ProcessPoolExecutor(max_workers=workers, initializer=init_worker, initargs=(str(ZIP_PATH),)) as pool:
+        rows = list(pool.map(image_features, items, chunksize=12))
+    return np.vstack(rows)
 
-cv = StratifiedKFold(5, shuffle=True, random_state=42)
-scores = {}
-for name, model in models.items():
-    s = cross_val_score(model, X, y, cv=cv, scoring='accuracy', n_jobs=-1)
-    scores[name] = s.mean()
-    print(name, 'CV accuracy', s.mean(), '+/-', s.std())
 
-weights = [max(scores[n]-0.33, 0.01) for n in ['extra','rf','hgb','svc']]
-ensemble = VotingClassifier(
-    estimators=[('extra',models['extra']),('rf',models['rf']),('hgb',models['hgb']),('svc',models['svc'])],
-    voting='soft', weights=weights, n_jobs=-1
-)
-ensemble.fit(X,y)
-pred = ensemble.predict(Xt).astype(int)
+X = feature_matrix(train_members, "train")
+Xt = feature_matrix(test_members, "test")
+print("Feature matrices:", X.shape, Xt.shape, flush=True)
 
-submission = pd.DataFrame({'id':[p.stem for p in test_items], 'label':pred})
-submission = submission.sort_values('id').reset_index(drop=True)
-submission.to_csv('submission_lighting.csv', index=False)
-print(submission.head())
-print('Class counts:', submission['label'].value_counts().sort_index().to_dict())
-print('Saved submission_lighting.csv')
+# Standardize using train statistics.
+mean = X.mean(axis=0)
+std = X.std(axis=0)
+std[std < 1e-6] = 1.0
+Z = (X - mean) / std
+Zt = (Xt - mean) / std
+classes = np.asarray([0, 1, 2], dtype=np.int64)
+
+# 1) Regularized linear discriminant classifier.
+class_means = np.vstack([Z[labels == cls].mean(axis=0) for cls in classes])
+centered = np.vstack([Z[labels == cls] - class_means[cls] for cls in classes])
+covariance = centered.T @ centered / max(1, len(Z) - len(classes))
+covariance += np.eye(covariance.shape[0], dtype=np.float32) * 0.35
+inverse_covariance = np.linalg.pinv(covariance)
+lda_scores = np.column_stack([
+    -0.5 * np.einsum("ij,jk,ik->i", Zt - class_means[cls], inverse_covariance, Zt - class_means[cls])
+    for cls in classes
+])
+
+# 2) Diagonal Gaussian classifier.
+variances = np.vstack([Z[labels == cls].var(axis=0) + 0.20 for cls in classes])
+nb_scores = np.column_stack([
+    -0.5 * (((Zt - class_means[cls]) ** 2 / variances[cls]).sum(axis=1) + np.log(variances[cls]).sum())
+    for cls in classes
+])
+
+# 3) Weighted k-nearest neighbours, vectorized for the 300 test rows.
+distances = ((Zt[:, None, :] - Z[None, :, :]) ** 2).mean(axis=2)
+k = min(21, len(Z))
+nearest = np.argpartition(distances, kth=k - 1, axis=1)[:, :k]
+knn_scores = np.zeros((len(Zt), 3), dtype=np.float64)
+for row_index in range(len(Zt)):
+    indices = nearest[row_index]
+    weights = 1.0 / (distances[row_index, indices] + 1e-5)
+    for cls in classes:
+        knn_scores[row_index, cls] = weights[labels[indices] == cls].sum()
+
+# 4) Ordered exposure thresholds optimized on training data.
+exposure_train = 0.45 * X[:, 0] + 0.25 * X[:, 8] + 0.20 * X[:, 12] + 0.10 * X[:, 21]
+exposure_test = 0.45 * Xt[:, 0] + 0.25 * Xt[:, 8] + 0.20 * Xt[:, 12] + 0.10 * Xt[:, 21]
+order = np.argsort(exposure_train)
+sorted_labels = labels[order]
+n = len(sorted_labels)
+cumulative = np.zeros((3, n + 1), dtype=np.int64)
+for cls in classes:
+    cumulative[cls, 1:] = np.cumsum(sorted_labels == cls)
+best_correct = -1
+best_i, best_j = n // 3, 2 * n // 3
+for i in range(1, n - 1):
+    correct_zero = cumulative[0, i]
+    for j in range(i + 1, n):
+        correct = correct_zero + (cumulative[1, j] - cumulative[1, i]) + (cumulative[2, n] - cumulative[2, j])
+        if correct > best_correct:
+            best_correct, best_i, best_j = int(correct), i, j
+sorted_exposure = exposure_train[order]
+t1 = float((sorted_exposure[best_i - 1] + sorted_exposure[best_i]) / 2)
+t2 = float((sorted_exposure[best_j - 1] + sorted_exposure[best_j]) / 2)
+threshold_predictions = np.where(exposure_test < t1, 0, np.where(exposure_test < t2, 1, 2))
+print(f"Exposure threshold train accuracy: {best_correct / n:.4f}", flush=True)
+
+# Normalize score matrices and combine with the ordered brightness decision.
+def softmax(scores: np.ndarray) -> np.ndarray:
+    shifted = scores - scores.max(axis=1, keepdims=True)
+    exponent = np.exp(np.clip(shifted, -40, 40))
+    return exponent / exponent.sum(axis=1, keepdims=True)
+
+combined = 0.36 * softmax(lda_scores) + 0.29 * softmax(nb_scores) + 0.25 * (knn_scores / (knn_scores.sum(axis=1, keepdims=True) + 1e-12))
+combined[np.arange(len(combined)), threshold_predictions] += 0.10
+predictions = combined.argmax(axis=1).astype(int)
+
+with Path("submission_lighting.csv").open("w", encoding="utf-8", newline="") as output:
+    writer = csv.writer(output)
+    writer.writerow(["id", "label"])
+    writer.writerows(zip(test_ids, predictions.tolist()))
+
+counts = {int(cls): int((predictions == cls).sum()) for cls in classes}
+print("Class counts:", counts, flush=True)
+print("Saved submission_lighting.csv", flush=True)
