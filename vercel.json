@@ -1,0 +1,6 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "python3 solve_lighting.py && mkdir -p public && cp submission_lighting.csv public/submission_lighting.csv && printf '<html><body><a href=\"/submission_lighting.csv\">Download submission</a></body></html>' > public/index.html",
+  "outputDirectory": "public",
+  "installCommand": "echo Using Python build"
+}
