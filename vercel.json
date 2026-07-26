@@ -1,6 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "buildCommand": "python3 --version && mkdir -p public && python3 --version > public/python.txt && printf '<html><body>python ok</body></html>' > public/index.html",
+  "buildCommand": "python3 -m venv .venv && .venv/bin/python -m pip install -q gdown && mkdir -p public && .venv/bin/python -c 'import gdown; print(gdown.__version__)' > public/gdown.txt && printf '<html><body>gdown ok</body></html>' > public/index.html",
   "outputDirectory": "public",
   "installCommand": "echo skip"
 }
